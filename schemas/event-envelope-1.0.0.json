@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amf.spec/schemas/event-envelope/1.0.0",
+  "title": "AMFEvent",
+  "description": "AMF event envelope. Conforms to CloudEvents v1.0 JSON format. Compatible with A2A Part.data and MS Fabric Eventstreams.",
+  "type": "object",
+  "required": ["specversion", "id", "source", "type", "time", "datacontenttype", "amfagentrole", "amfvisibility", "amfconfidence", "amfttl", "amfschemaversion", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "specversion":       { "type": "string", "const": "1.0" },
+    "id":                { "type": "string", "format": "uuid", "description": "Unique message ID" },
+    "source":            { "type": "string", "format": "uri-reference", "description": "SPIFFE ID or agent endpoint URI" },
+    "type":              { "type": "string", "description": "AMF event type; doubles as NATS subject",
+                           "enum": [
+                             "amf.discovery.capability.advertise",
+                             "amf.discovery.agent.heartbeat",
+                             "amf.task.announce",
+                             "amf.task.claim",
+                             "amf.task.delegate",
+                             "amf.task.progress",
+                             "amf.task.blocked",
+                             "amf.artifact.publish",
+                             "amf.evidence.publish",
+                             "amf.result.partial",
+                             "amf.result.final",
+                             "amf.policy.warning",
+                             "amf.policy.deny"
+                           ]},
+    "time":              { "type": "string", "format": "date-time" },
+    "datacontenttype":   { "type": "string", "const": "application/json" },
+    "dataschema":        { "type": "string", "format": "uri" },
+    "subject":           { "type": "string", "description": "task_id when relevant" },
+
+    "amftraceid":        { "type": "string", "format": "uuid" },
+    "amfparentid":       { "type": "string", "format": "uuid" },
+    "amftaskid":         { "type": "string", "format": "uuid" },
+    "amfagentrole":      { "type": "string", "enum": ["coordinator", "specialist", "watcher", "connector"] },
+    "amfvisibility":     { "type": "string", "enum": ["local", "mesh", "public"] },
+    "amfconfidence":     { "type": "string", "pattern": "^[01](\\.\\d+)?$", "description": "Confidence 0.0–1.0 as string (CE has no float type)" },
+    "amfttl":            { "type": "integer", "minimum": 0, "description": "Seconds until event expires" },
+    "amfschemaversion":  { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$", "description": "SemVer of this envelope schema" },
+    "amftrustdomain":    { "type": "string" },
+
+    "data": {
+      "type": "object",
+      "required": ["payload", "auth_context"],
+      "additionalProperties": false,
+      "properties": {
+        "payload":       { "type": "object", "description": "Event-specific data" },
+        "auth_context": {
+          "type": "object",
+          "required": ["identity", "trust_domain"],
+          "additionalProperties": false,
+          "properties": {
+            "identity":     { "type": "string", "description": "SPIFFE ID or DID of sender" },
+            "scopes":       { "type": "array", "items": { "type": "string" } },
+            "trust_domain": { "type": "string" }
+          }
+        },
+        "artifact_refs": { "type": "array", "items": { "type": "string", "format": "uri" } },
+        "evidence_refs": { "type": "array", "items": { "type": "string", "format": "uri" } }
+      }
+    }
+  }
+}

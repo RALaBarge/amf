@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://amf.spec/schemas/agent-record/1.0.0",
+  "title": "AgentRecord",
+  "description": "Minimal agent advertisement published via mDNS/DNS-SD (_amf-agent._tcp.local). MUST be ≤512 bytes when serialized. Richer details are fetched from card_url on demand.",
+  "type": "object",
+  "required": ["agent_id", "endpoint", "protocols_supported"],
+  "additionalProperties": false,
+  "properties": {
+    "agent_id":            { "type": "string", "description": "SPIFFE ID or W3C DID" },
+    "display_name":        { "type": "string", "maxLength": 64 },
+    "endpoint":            { "type": "string", "format": "uri", "description": "Base URL for A2A/MCP endpoints" },
+    "protocols_supported": { "type": "array", "items": { "type": "string", "enum": ["A2A/1.0", "MCP/2024-11-05"] }, "minItems": 1 },
+    "capability_tags":     { "type": "array", "items": { "type": "string" }, "description": "Low-risk keywords only. e.g. ['code-exec', 'web-search', 'pdf-parse']" },
+    "trust_domain":        { "type": "string", "description": "'local', 'team', or 'public'" },
+    "visibility":          { "type": "string", "enum": ["local", "mesh", "public"], "default": "local" },
+    "subscription_topics": { "type": "array", "items": { "type": "string" } },
+    "publish_topics":      { "type": "array", "items": { "type": "string" } },
+    "latency_class":       { "type": "string", "enum": ["realtime", "fast", "batch"] },
+    "cost_class":          { "type": "string", "enum": ["free", "low", "high"] },
+    "auth_requirements":   { "type": "object" },
+    "version":             { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "status":              { "type": "string", "enum": ["active", "draining", "offline"], "default": "active" },
+    "card_url":            { "type": "string", "format": "uri", "description": "Fetch full A2A agent card (/.well-known/agent-card.json)" }
+  }
+}

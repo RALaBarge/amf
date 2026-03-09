@@ -109,25 +109,16 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 	if msgType == "" {
 		msgType = "amf.test.event"
 	}
+	delete(payload, "message_type")
 
-	evt := AMFEvent{
-		MessageID:     uuid.New().String(),
-		TraceID:       uuid.New().String(),
-		AgentID:       "amf-dev",
-		AgentRole:     RoleCoordinator,
-		Timestamp:     time.Now().UTC(),
-		MessageType:   msgType,
-		Visibility:    VisibilityLocal,
-		Confidence:    1.0,
-		TTL:           60,
-		PayloadType:   "application/json",
-		Payload:       payload,
-		SchemaVersion: "1.0",
-		AuthContext: AuthContext{
-			Identity:    "spiffe://local/agent/amf-dev",
-			TrustDomain: "local",
-		},
-	}
+	id := uuid.New().String()
+	evt := NewEvent(
+		id, uuid.New().String(),
+		"spiffe://local/agent/amf-dev",
+		msgType,
+		RoleCoordinator,
+		payload,
+	)
 
 	data, err := json.Marshal(evt)
 	if err != nil {
@@ -135,14 +126,14 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := nc.Publish(msgType, data); err != nil {
+	if err := nc.Publish(evt.Type, data); err != nil {
 		http.Error(w, "publish failed", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("published %s", msgType)
+	log.Printf("published %s", evt.Type)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "subject": msgType, "message_id": evt.MessageID})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "subject": evt.Type, "message_id": evt.ID})
 }
 
 // GET /health
@@ -169,24 +160,17 @@ func main() {
 	connectNATS()
 	defer nc.Close()
 
-	// Publish a startup event
-	startEvt := AMFEvent{
-		MessageID:     uuid.New().String(),
-		TraceID:       uuid.New().String(),
-		AgentID:       "amf-dev",
-		AgentRole:     RoleCoordinator,
-		Timestamp:     time.Now().UTC(),
-		MessageType:   "amf.discovery.agent.heartbeat",
-		Visibility:    VisibilityLocal,
-		Confidence:    1.0,
-		TTL:           60,
-		PayloadType:   "application/json",
-		Payload:       map[string]string{"status": "online", "note": "AMF dev stack started"},
-		SchemaVersion: "1.0",
-		AuthContext:   AuthContext{Identity: "spiffe://local/agent/amf-dev", TrustDomain: "local"},
-	}
+	// Publish a startup heartbeat
+	id := uuid.New().String()
+	startEvt := NewEvent(
+		id, uuid.New().String(),
+		"spiffe://local/agent/amf-dev",
+		TypeAgentHeartbeat,
+		RoleCoordinator,
+		map[string]string{"status": "online", "note": "AMF dev stack started"},
+	)
 	if data, err := json.Marshal(startEvt); err == nil {
-		nc.Publish(startEvt.MessageType, data)
+		nc.Publish(startEvt.Type, data)
 	}
 
 	mux := http.NewServeMux()
