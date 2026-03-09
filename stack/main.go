@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -147,6 +148,43 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": status, "nats": natsURL})
 }
 
+// GET /.well-known/agent-card.json — A2A agent card (full capability description)
+func handleAgentCard(rec AgentRecord) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		card := map[string]any{
+			"name":        "AMF Dev Node",
+			"description": "AMF observability and event fabric node",
+			"url":         rec.Endpoint,
+			"version":     rec.Version,
+			"capabilities": map[string]bool{
+				"streaming":         true,
+				"pushNotifications": false,
+			},
+			"skills": []map[string]any{
+				{
+					"id":          "event-fabric",
+					"name":        "Event Fabric",
+					"description": "Publish and subscribe to typed AMF events via NATS",
+					"tags":        rec.CapabilityTags,
+				},
+			},
+			"defaultInputModes":  []string{"application/json"},
+			"defaultOutputModes": []string{"application/json", "text/event-stream"},
+			// AMF extensions
+			"x-amf": map[string]any{
+				"agent_record":    rec,
+				"schema_version":  "1.0.0",
+				"protocols":       rec.ProtocolsSupported,
+				"trust_domain":    rec.TrustDomain,
+				"nats_url":        natsURL,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json.NewEncoder(w).Encode(card)
+	}
+}
+
 // GET / — web UI
 func handleUI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html")
@@ -173,9 +211,36 @@ func main() {
 		nc.Publish(startEvt.Type, data)
 	}
 
+	// Start mDNS — register self and browse for peers
+	agentID := uuid.New().String()
+	selfRecord := AgentRecord{
+		AgentID:            "spiffe://local/agent/" + agentID,
+		Endpoint:           fmt.Sprintf("http://localhost%s", httpAddr),
+		ProtocolsSupported: []string{"A2A/1.0", "MCP/2024-11-05"},
+		CapabilityTags:     []string{"observability", "event-fabric"},
+		TrustDomain:        "local",
+		Visibility:         "local",
+		Version:            "1.0.0",
+		Status:             "active",
+		CardURL:            fmt.Sprintf("http://localhost%s/.well-known/agent-card.json", httpAddr),
+	}
+
+	mdnsCtx, mdnsCancel := context.WithCancel(context.Background())
+	defer mdnsCancel()
+
+	mdnsSrv, err := RegisterSelf(mdnsCtx, "amf-dev", mdnsPort, selfRecord)
+	if err != nil {
+		log.Printf("mDNS register warning: %v", err)
+	} else {
+		defer mdnsSrv.Shutdown()
+	}
+	go BrowseAgents(mdnsCtx)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/events", handleEvents)
 	mux.HandleFunc("/publish", handlePublish)
+	mux.HandleFunc("/agents", handleAgents)
+	mux.HandleFunc("/.well-known/agent-card.json", handleAgentCard(selfRecord))
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/", handleUI)
 
@@ -212,8 +277,14 @@ const indexHTML = `<!DOCTYPE html>
   button:hover { background: #30363d; }
   button.primary { background: #238636; border-color: #2ea043; }
   button.primary:hover { background: #2ea043; }
-  #log { height: calc(100vh - 130px); overflow-y: auto; padding: 12px 24px; }
-  .event { padding: 8px 0; border-bottom: 1px solid #161b22; display: grid; grid-template-columns: 140px 220px 1fr; gap: 12px; align-items: start; }
+  .tabs { display: flex; gap: 0; border-bottom: 1px solid #21262d; padding: 0 24px; }
+  .tab { padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; color: #8b949e; font-size: 12px; }
+  .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  #log { height: calc(100vh - 175px); overflow-y: auto; padding: 12px 24px; }
+  #agents-panel { height: calc(100vh - 175px); overflow-y: auto; padding: 16px 24px; }
+  .event { padding: 8px 0; border-bottom: 1px solid #161b22; display: grid; grid-template-columns: 140px 240px 1fr; gap: 12px; align-items: start; }
   .event:hover { background: #161b22; margin: 0 -24px; padding: 8px 24px; }
   .ts { color: #8b949e; font-size: 11px; padding-top: 2px; }
   .subject { color: #79c0ff; }
@@ -226,10 +297,19 @@ const indexHTML = `<!DOCTYPE html>
   .payload .key { color: #79c0ff; }
   .payload .str { color: #a5d6ff; }
   .payload .num { color: #79c0ff; }
+  .agent-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+  .agent-id { color: #58a6ff; font-size: 12px; }
+  .agent-meta { color: #8b949e; font-size: 11px; margin-top: 4px; }
+  .agent-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .tag { background: #21262d; border: 1px solid #30363d; padding: 2px 8px; border-radius: 10px; font-size: 11px; color: #79c0ff; }
+  .proto-badge { background: #1f3a2d; border: 1px solid #2ea043; color: #3fb950; padding: 2px 8px; border-radius: 10px; font-size: 10px; }
+  .seen { color: #8b949e; font-size: 10px; text-align: right; }
+  .no-agents { color: #8b949e; padding: 32px; text-align: center; }
   .publish-bar { padding: 12px 24px; border-top: 1px solid #21262d; display: flex; gap: 8px; }
   input[type=text] { flex: 1; background: #161b22; border: 1px solid #30363d; color: #e6edf3; padding: 6px 12px; border-radius: 6px; font-family: inherit; font-size: 12px; }
   input[type=text]:focus { outline: none; border-color: #58a6ff; }
   #count { color: #8b949e; font-size: 11px; }
+  #agent-count { color: #8b949e; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -237,19 +317,30 @@ const indexHTML = `<!DOCTYPE html>
   <h1>AMF Event Fabric</h1>
   <span class="status disconnected" id="status">disconnected</span>
   <span id="count">0 events</span>
+  <span id="agent-count">0 agents</span>
   <div class="controls">
+    <button onclick="refreshAgents()">Refresh</button>
     <button onclick="clearLog()">Clear</button>
     <button onclick="togglePause()" id="pauseBtn">Pause</button>
   </div>
 </header>
-<div id="log"></div>
-<div class="publish-bar">
-  <input type="text" id="msgType" value="amf.task.announce" placeholder="message_type">
-  <input type="text" id="payload" value='{"task": "test task", "priority": "normal"}' placeholder='{"key": "value"}'>
-  <button class="primary" onclick="publish()">Publish</button>
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('events')">Events</div>
+  <div class="tab" onclick="switchTab('agents')">Mesh Agents</div>
+</div>
+<div id="events-panel" class="panel active">
+  <div id="log"></div>
+  <div class="publish-bar">
+    <input type="text" id="msgType" value="amf.task.announce" placeholder="message_type">
+    <input type="text" id="payload" value='{"task": "test task", "priority": "normal"}' placeholder='{"key": "value"}'>
+    <button class="primary" onclick="publish()">Publish</button>
+  </div>
+</div>
+<div id="agents-panel" class="panel">
+  <div id="agents-list"><div class="no-agents">Browsing for agents on local mesh...</div></div>
 </div>
 <script>
-let count = 0, paused = false, es;
+let count = 0, paused = false;
 
 function colorSubject(s) {
   if (s.includes('.discovery.')) return 'discovery';
@@ -282,66 +373,35 @@ function addEvent(subject, data) {
   log.appendChild(div);
   log.scrollTop = log.scrollHeight;
   document.getElementById('count').textContent = (++count) + ' events';
+  if (subject.includes('discovery')) refreshAgents();
 }
 
-function connect() {
-  es = new EventSource('/events');
-  es.onopen = () => {
-    const s = document.getElementById('status');
-    s.textContent = 'connected'; s.className = 'status connected';
-  };
-  es.onerror = () => {
-    const s = document.getElementById('status');
-    s.textContent = 'reconnecting...'; s.className = 'status disconnected';
-    setTimeout(connect, 2000);
-  };
-  es.addEventListener('message', e => addEvent('system', e.data));
-  // catch all named events (amf subjects)
-  const origAddEventListener = es.addEventListener.bind(es);
-  es.onmessage = e => addEvent('system', e.data);
-  // Use a polling approach for named events via EventSource
-}
-
-// EventSource only fires onmessage for unnamed events.
-// Our server sends named events (event: amf.task.announce).
-// We need a custom reader.
 function connectSSE() {
   const statusEl = document.getElementById('status');
-  const reader = new ReadableStream({
-    start(controller) {
-      fetch('/events').then(res => {
-        const r = res.body.getReader();
-        statusEl.textContent = 'connected'; statusEl.className = 'status connected';
-        let buf = '';
-        function pump() {
-          return r.read().then(({ done, value }) => {
-            if (done) {
-              statusEl.textContent = 'reconnecting...'; statusEl.className = 'status disconnected';
-              setTimeout(connectSSE, 2000);
-              return;
-            }
-            buf += new TextDecoder().decode(value);
-            const blocks = buf.split('\n\n');
-            buf = blocks.pop();
-            for (const block of blocks) {
-              const lines = block.split('\n');
-              let subject = 'amf.event', data = '';
-              for (const l of lines) {
-                if (l.startsWith('event: ')) subject = l.slice(7);
-                if (l.startsWith('data: ')) data = l.slice(6);
-              }
-              if (data) addEvent(subject, data);
-            }
-            return pump();
-          });
+  fetch('/events').then(res => {
+    const r = res.body.getReader();
+    statusEl.textContent = 'connected'; statusEl.className = 'status connected';
+    let buf = '';
+    function pump() {
+      return r.read().then(({ done, value }) => {
+        if (done) { statusEl.textContent = 'reconnecting...'; statusEl.className = 'status disconnected'; setTimeout(connectSSE, 2000); return; }
+        buf += new TextDecoder().decode(value);
+        const blocks = buf.split('\n\n');
+        buf = blocks.pop();
+        for (const block of blocks) {
+          const lines = block.split('\n');
+          let subject = 'amf.event', data = '';
+          for (const l of lines) {
+            if (l.startsWith('event: ')) subject = l.slice(7);
+            if (l.startsWith('data: ')) data = l.slice(6);
+          }
+          if (data) addEvent(subject, data);
         }
         return pump();
-      }).catch(() => {
-        statusEl.textContent = 'reconnecting...'; statusEl.className = 'status disconnected';
-        setTimeout(connectSSE, 2000);
       });
     }
-  });
+    return pump();
+  }).catch(() => { setTimeout(connectSSE, 2000); });
 }
 
 async function publish() {
@@ -350,25 +410,47 @@ async function publish() {
   let payload;
   try { payload = JSON.parse(payloadStr); } catch(e) { alert('invalid JSON payload'); return; }
   payload.message_type = msgType;
-  await fetch('/publish', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload)
-  });
+  await fetch('/publish', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
 }
 
-function clearLog() {
-  document.getElementById('log').innerHTML = '';
-  count = 0;
-  document.getElementById('count').textContent = '0 events';
+async function refreshAgents() {
+  const res = await fetch('/agents');
+  const j = await res.json();
+  document.getElementById('agent-count').textContent = j.count + ' agent' + (j.count !== 1 ? 's' : '');
+  const list = document.getElementById('agents-list');
+  if (!j.agents || j.agents.length === 0) {
+    list.innerHTML = '<div class="no-agents">No agents discovered yet. Browsing ' + mdnsService + '...</div>';
+    return;
+  }
+  list.innerHTML = j.agents.map(a => {
+    const r = a.record;
+    const protos = (r.protocols_supported||[]).map(p => '<span class="proto-badge">'+p+'</span>').join(' ');
+    const tags = (r.capability_tags||[]).map(t => '<span class="tag">'+t+'</span>').join('');
+    const ago = Math.round((Date.now() - new Date(a.seen_at)) / 1000);
+    return '<div class="agent-card">' +
+      '<div>' +
+        '<div class="agent-id">' + (r.agent_id||a.instance_name) + '</div>' +
+        '<div class="agent-meta">' + (r.endpoint||a.host+':'+a.port) + ' · ' + r.trust_domain + ' · ' + protos + '</div>' +
+        '<div class="agent-tags">' + tags + '</div>' +
+      '</div>' +
+      '<div class="seen">seen ' + ago + 's ago<br>' + r.status + '</div>' +
+    '</div>';
+  }).join('');
 }
 
-function togglePause() {
-  paused = !paused;
-  document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
+const mdnsService = '_amf-agent._tcp';
+function clearLog() { document.getElementById('log').innerHTML = ''; count = 0; document.getElementById('count').textContent = '0 events'; }
+function togglePause() { paused = !paused; document.getElementById('pauseBtn').textContent = paused ? 'Resume' : 'Pause'; }
+function switchTab(t) {
+  document.querySelectorAll('.tab').forEach((el,i) => el.classList.toggle('active', ['events','agents'][i]===t));
+  document.querySelectorAll('.panel').forEach(el => el.classList.remove('active'));
+  document.getElementById(t+'-panel').classList.add('active');
+  if (t === 'agents') refreshAgents();
 }
 
 connectSSE();
+refreshAgents();
+setInterval(refreshAgents, 10000);
 </script>
 </body>
 </html>`
