@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/grandcat/zeroconf"
 )
 
@@ -109,47 +109,27 @@ func handleDiscoveredEntry(entry *zeroconf.ServiceEntry) {
 		return
 	}
 
-	agent := &DiscoveredAgent{
-		Record:       rec,
-		InstanceName: entry.Instance,
-		Host:         entry.HostName,
-		Port:         entry.Port,
-		SeenAt:       time.Now(),
-	}
+	log.Printf("mDNS: raw advertisement from %s at %s:%d — routing through DMZ watcher", entry.Instance, entry.HostName, entry.Port)
 
-	agentRegistry.Lock()
-	agentRegistry.agents[rec.AgentID] = agent
-	agentRegistry.Unlock()
-
-	log.Printf("mDNS: discovered agent %s at %s:%d (tags: %v)", rec.AgentID, entry.HostName, entry.Port, rec.CapabilityTags)
-
-	// Publish discovery event to NATS fabric
+	// Route through DMZ watcher — do NOT add to registry or publish directly.
+	// The watcher validates, risk-scores, and publishes to amf.internal.classified.
+	// The coordinator subscribes to amf.internal.classified and makes the final decision.
 	if nc != nil && nc.IsConnected() {
-		id := uuid.New().String()
-		evt := NewEvent(
-			id, uuid.New().String(),
-			"spiffe://local/agent/amf-discovery",
-			TypeCapabilityAdvertise,
-			RoleWatcher,
-			agent,
-		)
-		evt.TrustDomain = rec.TrustDomain
-		if data, err := json.Marshal(evt); err == nil {
-			nc.Publish(evt.Type, data)
+		raw, err := json.Marshal(rec)
+		if err == nil {
+			nc.Publish(rawSubject, raw)
 		}
 	}
 }
 
 // agentRecordToTXT encodes an AgentRecord as DNS-SD TXT key=value pairs.
-// Uses short keys to stay under the 512-byte limit.
+// Uses comma-separated values (not JSON) to avoid quote-escaping issues in zeroconf.
 func agentRecordToTXT(rec AgentRecord) []string {
-	protos, _ := json.Marshal(rec.ProtocolsSupported)
-	tags, _ := json.Marshal(rec.CapabilityTags)
 	return []string{
 		"id=" + rec.AgentID,
 		"ep=" + rec.Endpoint,
-		"proto=" + string(protos),
-		"tags=" + string(tags),
+		"proto=" + strings.Join(rec.ProtocolsSupported, ","),
+		"tags=" + strings.Join(rec.CapabilityTags, ","),
 		"td=" + rec.TrustDomain,
 		"vis=" + rec.Visibility,
 		"v=" + rec.Version,
@@ -172,15 +152,17 @@ func txtToAgentRecord(txt []string) (AgentRecord, error) {
 	if m["id"] == "" || m["ep"] == "" {
 		return AgentRecord{}, fmt.Errorf("missing required fields id or ep")
 	}
-	var protos, tags []string
-	json.Unmarshal([]byte(m["proto"]), &protos)
-	json.Unmarshal([]byte(m["tags"]), &tags)
-
+	splitCSV := func(s string) []string {
+		if s == "" {
+			return nil
+		}
+		return strings.Split(s, ",")
+	}
 	return AgentRecord{
 		AgentID:            m["id"],
 		Endpoint:           m["ep"],
-		ProtocolsSupported: protos,
-		CapabilityTags:     tags,
+		ProtocolsSupported: splitCSV(m["proto"]),
+		CapabilityTags:     splitCSV(m["tags"]),
 		TrustDomain:        m["td"],
 		Visibility:         m["vis"],
 		Version:            m["v"],

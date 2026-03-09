@@ -211,6 +211,63 @@ func main() {
 		nc.Publish(startEvt.Type, data)
 	}
 
+	// Start OPA policy engine
+	StartOPA("policies")
+	defer StopOPA()
+
+	// Start DMZ watcher loop (auto-respawning)
+	watcherCtx, watcherCancel := context.WithCancel(context.Background())
+	defer watcherCancel()
+	StartWatcherLoop(watcherCtx)
+
+	// Coordinator: subscribe to classified summaries from the watcher, run OPA, admit to registry
+	nc.Subscribe(classifiedSubject, func(msg *nats.Msg) {
+		var summary WatcherSummary
+		if err := json.Unmarshal(msg.Data, &summary); err != nil {
+			log.Printf("coordinator: bad classified message: %v", err)
+			return
+		}
+
+		// OPA policy check
+		allowed := EvaluateAdvertisement(&summary)
+		summary.Approved = allowed
+
+		if !allowed {
+			return
+		}
+
+		// Admit to registry
+		agent := &DiscoveredAgent{
+			Record: AgentRecord{
+				AgentID:            summary.OriginalAgentID,
+				Endpoint:           summary.Endpoint,
+				ProtocolsSupported: summary.ProtocolsSupported,
+				CapabilityTags:     summary.ExtractedCapabilities,
+				TrustDomain:        summary.TrustDomain,
+				CardURL:            summary.CardURL,
+				Status:             "active",
+			},
+			SeenAt: time.Now(),
+		}
+		agentRegistry.Lock()
+		agentRegistry.agents[summary.OriginalAgentID] = agent
+		agentRegistry.Unlock()
+
+		// Publish capability.advertise to the public fabric
+		id := uuid.New().String()
+		evt := NewEvent(id, uuid.New().String(),
+			"spiffe://local/coordinator",
+			TypeCapabilityAdvertise,
+			RoleCoordinator,
+			summary,
+		)
+		evt.TrustDomain = summary.TrustDomain
+		if data, err := json.Marshal(evt); err == nil {
+			nc.Publish(evt.Type, data)
+		}
+		log.Printf("coordinator: admitted agent %s to mesh", summary.OriginalAgentID)
+	})
+
 	// Start mDNS — register self and browse for peers
 	agentID := uuid.New().String()
 	selfRecord := AgentRecord{
