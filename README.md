@@ -126,6 +126,48 @@ stack/                         Go reference implementation
 2600/                          design discussion archive
 ```
 
+## Architecture Decisions
+
+The following decisions are locked. See [2600/open-decisions-session-1.md](2600/open-decisions-session-1.md) for full rationale.
+
+**Discovery**
+- Agents that declare `MCP/...` in `proto` MUST include `mcp=<url>` in their TXT record. Omitting it fails deterministic validation before the watcher runs.
+- `nats_url` is included in agent cards only for coordinators and fabric relay nodes. Workers and specialists omit it.
+
+**Identity and authority**
+- `local` visibility events: self-asserted delegation chains are accepted. OPA checks structural validity only.
+- `mesh` and `public` visibility events: a verifiable SVID (`svid_verified: true`) is required. StaticIdentity deployments are restricted to `local` visibility.
+- Delegated scopes must be a strict subset of the delegator's effective scopes. Coordinators hold the full scope vocabulary implicitly.
+- SPIFFE fallback policy: `AMF_IDENTITY_MODE=spiffe` with no socket → hard fail. `SPIFFE_ENDPOINT_SOCKET` present but unavailable → fall back to static for `local` agents only; `mesh`/`public` denied at OPA. Neither set → static, `local` only.
+
+**NATS topology**
+- v1: single NATS server with per-role username/password ACLs (coordinator, specialist, watcher, connector). Migration path to per-trust-domain account separation is a config change, not a protocol change.
+
+**Task claiming**
+- Workers subscribe to `amf.task.announce.<capability_tag>` as a NATS queue group keyed `workers.<capability_tag>`. NATS guarantees single delivery; no coordinator arbitration is needed for claim races.
+
+**Task lifecycle**
+- TTL expiry: coordinator emits `amf.policy.warning`, signals requester via `reply_subject` if set, then discards. Optional `max_retries` and `retry_delay_seconds` in the task payload enable bounded republishing before escalation.
+- Delegation: cycle detection (same agent appears twice in chain) is mandatory and non-overridable. Max delegation depth defaults to 5, configurable in OPA policy.
+- Reply subjects: MUST match `amf.internal.reply.<task_id>`. Enforced by NATS ACL on specialist credentials and validated by the coordinator before routing.
+
+**Admission policy**
+- Risk score thresholds are defined in the OPA data document per trust domain (`data.policy.thresholds`). Defaults: `local` → 0.7, `mesh` → 0.3, `public` → 0.1.
+- Watcher field cross-verification: after receiving a WatcherSummary, the coordinator independently re-parses the raw advertisement and verifies `original_agent_id`, `endpoint`, `protocols_supported`, `trust_domain`, and `card_url` against TXT record fields. Discrepancies floor `risk_score` to 1.0 and emit a policy warning.
+- Capability tags MUST match `[a-z0-9-]+`. Tags outside this charset are rejected at deterministic validation. The watcher LLM receives advertisement content in a data-role turn, not the instruction turn.
+
+**Connector role**
+- Connector NATS credentials grant publish rights to `amf.internal.raw` only. Rate limiting is deferred to the first concrete connector implementation; external rate limiting (gateway, nginx) is recommended in the interim.
+
+**A2A interop**
+- NATS subscription is the canonical push mechanism. A2A push notifications (SSE callback URLs) are not supported in v1. A bridge adapter is a v2 roadmap item.
+
+**MCP routing (partially open)**
+- Internal coordinator-initiated MCP calls use Model B (coordinator proxy): `POST /v1/mcp/proxy?agent=<id>`, with OPA enforcement and auth headers per call. When SPIFFE is active, the coordinator presents a JWT-SVID; otherwise calls to `local` trust domain agents are unauthenticated.
+- A single federated MCP endpoint (Model C) that aggregates all admitted agents' tools is a target for a future version. The v1 scope is open — see [2600/open-decisions-session-1.md](2600/open-decisions-session-1.md) #11.
+
+---
+
 ## Specification
 
 See [SPEC.md](SPEC.md) for the full protocol specification: event types, schemas, discovery flow, DMZ watcher architecture, task state machine, MCP integration, and A2A/CloudEvents compatibility.
