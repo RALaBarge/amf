@@ -36,11 +36,58 @@ const (
 	RoleConnector   AgentRole = "connector"
 )
 
-// AuthContext — lives inside Data, not as a CE extension (CE extensions are scalars only)
+// Scope is a defined AMF capability grant.
+// Scopes are declared in auth_context.scopes and enforced by OPA.
+// An agent may only claim scopes that were granted to it by an authority
+// (coordinator or delegating agent) — self-asserted scopes beyond what the
+// NATS ACL permits are ignored by policy.
+type Scope = string
+
+const (
+	// Task lifecycle
+	ScopeDispatchTasks Scope = "dispatch:tasks"  // announce and delegate tasks
+	ScopeClaimTasks    Scope = "claim:tasks"     // take ownership of announced tasks
+
+	// Registry
+	ScopeReadRegistry  Scope = "read:registry"   // read the admitted agent list
+	ScopeWriteRegistry Scope = "write:registry"  // admit / evict agents (coordinator only)
+
+	// MCP
+	ScopeCallMCP Scope = "call:mcp" // invoke MCP tools on admitted agents
+
+	// Internal pipeline (enforced by NATS ACL, not just policy)
+	ScopeIngestRaw     Scope = "ingest:raw"     // publish to amf.internal.raw (connector)
+	ScopeClassify      Scope = "classify"       // publish to amf.internal.classified (watcher)
+)
+
+// AuthContext captures both origin and authority for an event.
+//
+// Origin  = who sent this (Identity — verified by SPIFFE if available)
+// Authority = under what grant are they acting, and who issued that grant
+//
+// These are separate concerns. A specialist agent's identity is always its
+// own SPIFFE ID, but its authority to claim a specific task was granted by
+// the coordinator when it announced that task. The authority chain lets OPA
+// verify the full provenance: not just "is this a valid agent" but "did
+// a trusted authority actually authorize this action."
+//
+// For locally-initiated actions (coordinator acting on its own authority),
+// GrantedBy == Identity and DelegationChain is empty.
+//
+// For delegated actions (coordinator → specialist → sub-task),
+// GrantedBy is the immediate delegator, DelegationChain is the full path
+// from the root authority to the current actor (root-first order).
 type AuthContext struct {
-	Identity    string   `json:"identity"`
-	Scopes      []string `json:"scopes"`
-	TrustDomain string   `json:"trust_domain"`
+	// Origin
+	Identity    string `json:"identity"`     // SPIFFE ID of the sender
+	TrustDomain string `json:"trust_domain"` // trust domain of the sender
+
+	// Authority
+	Scopes          []string `json:"scopes"`                    // what this agent is authorized to do in this event
+	GrantedBy       string   `json:"granted_by,omitempty"`      // identity that issued this authority grant
+	DelegationChain []string `json:"delegation_chain,omitempty"` // [root, ..., immediate_parent] — empty if self-issued
+	IssuedAt        string   `json:"issued_at,omitempty"`       // RFC3339 — when authority was granted
+	ExpiresAt       string   `json:"expires_at,omitempty"`      // RFC3339 — optional expiry (omit = task TTL applies)
 }
 
 // AMFData is the CloudEvents `data` field.
@@ -98,8 +145,12 @@ type AMFEvent struct {
 	Data *AMFData `json:"data"`
 }
 
-// NewEvent constructs an AMFEvent with CloudEvents defaults filled in.
+// NewEvent constructs an AMFEvent where the sender acts on its own authority.
+// GrantedBy == source (self-issued). Use NewDelegatedEvent when acting under
+// authority granted by another agent.
 func NewEvent(id, traceID, source, eventType string, role AgentRole, payload any) *AMFEvent {
+	now := time.Now().UTC().Format(time.RFC3339)
+	scopes := defaultScopesForRole(role)
 	return &AMFEvent{
 		SpecVersion:     "1.0",
 		ID:              id,
@@ -117,12 +168,65 @@ func NewEvent(id, traceID, source, eventType string, role AgentRole, payload any
 		Data: &AMFData{
 			Payload: payload,
 			AuthContext: AuthContext{
-				Identity:    "spiffe://local/agent/" + id,
-				TrustDomain: "local",
-				Scopes:      []string{},
+				Identity:    source,
+				TrustDomain: trustDomainFrom(source),
+				Scopes:      scopes,
+				GrantedBy:   source, // self-issued — sender is its own authority root
+				IssuedAt:    now,
 			},
 		},
 	}
+}
+
+// NewDelegatedEvent constructs an AMFEvent where the sender acts under authority
+// granted by another agent (e.g. a specialist acting on a task delegated by the
+// coordinator). The delegation chain records the provenance so OPA can verify
+// the full authority path.
+//
+// grantedBy: the immediate delegator's SPIFFE ID
+// chain: ordered from root authority to immediate parent (empty if direct delegation from root)
+// scopes: the specific scopes granted for this delegation (should be ⊆ delegator's scopes)
+func NewDelegatedEvent(id, traceID, source, eventType string, role AgentRole,
+	grantedBy string, chain []string, scopes []Scope, payload any) *AMFEvent {
+	evt := NewEvent(id, traceID, source, eventType, role, payload)
+	evt.Data.AuthContext.Scopes = scopes
+	evt.Data.AuthContext.GrantedBy = grantedBy
+	evt.Data.AuthContext.DelegationChain = chain
+	return evt
+}
+
+// defaultScopesForRole returns the baseline scope set for a role acting
+// under its own authority. Delegated grants may be narrower.
+func defaultScopesForRole(role AgentRole) []Scope {
+	switch role {
+	case RoleCoordinator:
+		return []Scope{ScopeDispatchTasks, ScopeReadRegistry, ScopeWriteRegistry, ScopeCallMCP}
+	case RoleSpecialist:
+		return []Scope{ScopeClaimTasks}
+	case RoleWatcher:
+		return []Scope{ScopeClassify}
+	case RoleConnector:
+		return []Scope{ScopeIngestRaw}
+	default:
+		return []Scope{}
+	}
+}
+
+// trustDomainFrom extracts the trust domain from a SPIFFE ID.
+// "spiffe://local/agent/abc" → "local"
+// Returns "unknown" if the ID is not a SPIFFE URI.
+func trustDomainFrom(spiffeID string) string {
+	const prefix = "spiffe://"
+	if len(spiffeID) <= len(prefix) {
+		return "unknown"
+	}
+	rest := spiffeID[len(prefix):]
+	for i, c := range rest {
+		if c == '/' {
+			return rest[:i]
+		}
+	}
+	return rest // no path component, whole thing is trust domain
 }
 
 // A2APart wraps an AMFEvent for transport inside an A2A message.

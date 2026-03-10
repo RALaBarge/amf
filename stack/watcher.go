@@ -2,17 +2,12 @@ package main
 
 // DMZ Watcher
 //
-// One goroutine per "session" — processes inbound raw advertisements from
-// amf.internal.raw, validates them deterministically, optionally calls an LLM
-// to summarize and risk-score, then emits a structured summary to
-// amf.internal.classified for the trusted coordinator.
+// One goroutine per connection — spawned fresh for every inbound advertisement
+// on amf.internal.raw. Validates deterministically, optionally calls an LLM
+// to summarize and risk-score, emits WatcherSummary to amf.internal.classified.
 //
-// After MAX_WATCHER_MSGS messages or MAX_WATCHER_LIFETIME, the goroutine exits.
-// The coordinator respawns it immediately — this is the disposable boundary pattern.
-//
-// CRITICAL: The watcher has NO access to durable memory, user context, or
-// privileged tools. It may only read the inbound advertisement and write a
-// structured summary. It never writes to the main agent registry directly.
+// CRITICAL: Each goroutine is fully disposable — no shared state, no durable
+// memory, no privileged access. Dies immediately after processing one message.
 
 import (
 	"bytes"
@@ -26,13 +21,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	nats "github.com/nats-io/nats.go"
 )
 
 const (
 	rawSubject        = "amf.internal.raw"
 	classifiedSubject = "amf.internal.classified"
-	maxWatcherMsgs    = 50
-	maxWatcherLife    = 15 * time.Minute
 	maxAdSizeBytes    = 512
 )
 
@@ -53,59 +47,36 @@ type WatcherSummary struct {
 	ProcessedAt         time.Time `json:"processed_at"`
 }
 
-// RunWatcher starts one watcher session. It blocks until the session ends
-// (message limit, lifetime limit, or context cancellation).
-// Call in a goroutine; the coordinator respawns on return.
-func RunWatcher(ctx context.Context, sessionID string) {
-	start := time.Now()
-	msgCount := 0
-	log.Printf("watcher[%s]: started (max %d msgs, %s lifetime)", sessionID, maxWatcherMsgs, maxWatcherLife)
+// RunWatcher processes exactly one advertisement and exits.
+// Opens its own restricted NATS connection using watcher credentials
+// (ACL: may only publish to amf.internal.classified and amf.policy.*).
+// Falls back to coordinator connection if natsCfg is not yet initialized.
+func RunWatcher(raw []byte) {
+	sessionID := uuid.New().String()[:8]
 
-	sub, err := nc.SubscribeSync(rawSubject)
-	if err != nil {
-		log.Printf("watcher[%s]: subscribe error: %v", sessionID, err)
+	var watcherNC *nats.Conn
+	if natsCfg != nil {
+		var err error
+		watcherNC, err = nats.Connect(natsCfg.WatcherURL())
+		if err != nil {
+			log.Printf("watcher[%s]: restricted connect failed, using coordinator conn: %v", sessionID, err)
+			watcherNC = nc
+		} else {
+			defer watcherNC.Close()
+		}
+	} else {
+		watcherNC = nc
+	}
+
+	summary := processAdvertisement(raw, sessionID)
+	if summary == nil {
 		return
 	}
-	defer sub.Unsubscribe()
-
-	for {
-		// Exit conditions
-		if msgCount >= maxWatcherMsgs {
-			log.Printf("watcher[%s]: message limit reached (%d), exiting", sessionID, msgCount)
-			return
-		}
-		if time.Since(start) >= maxWatcherLife {
-			log.Printf("watcher[%s]: lifetime exceeded, exiting", sessionID)
-			return
-		}
-		select {
-		case <-ctx.Done():
-			log.Printf("watcher[%s]: context cancelled, exiting", sessionID)
-			return
-		default:
-		}
-
-		msg, err := sub.NextMsgWithContext(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-
-		summary := processAdvertisement(msg.Data, sessionID)
-		if summary == nil {
-			msgCount++
-			continue
-		}
-
-		data, err := json.Marshal(summary)
-		if err == nil {
-			nc.Publish(classifiedSubject, data)
-			log.Printf("watcher[%s]: classified agent %s risk=%.2f approved=%v",
-				sessionID, summary.OriginalAgentID, summary.RiskScore, summary.Approved)
-		}
-		msgCount++
+	data, err := json.Marshal(summary)
+	if err == nil {
+		watcherNC.Publish(classifiedSubject, data)
+		log.Printf("watcher[%s]: classified agent %s risk=%.2f",
+			sessionID, summary.OriginalAgentID, summary.RiskScore)
 	}
 }
 
@@ -301,22 +272,21 @@ func publishPolicyEvent(eventType, reason, watcherID string) {
 	}
 }
 
-// StartWatcherLoop runs a watcher and respawns it automatically when it exits.
+// StartWatcherLoop subscribes to amf.internal.raw and spawns one fresh
+// RunWatcher goroutine per message. Each is fully disposable — dies when done.
 func StartWatcherLoop(ctx context.Context) {
+	sub, err := nc.Subscribe(rawSubject, func(msg *nats.Msg) {
+		raw := make([]byte, len(msg.Data))
+		copy(raw, msg.Data)
+		go RunWatcher(raw)
+	})
+	if err != nil {
+		log.Printf("watcher: subscribe error: %v", err)
+		return
+	}
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				sessionID := uuid.New().String()[:8]
-				RunWatcher(ctx, sessionID)
-				if ctx.Err() != nil {
-					return
-				}
-				log.Printf("watcher[%s]: respawning new session", sessionID)
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
+		<-ctx.Done()
+		sub.Unsubscribe()
 	}()
+	log.Printf("watcher: per-connection mode active on %s (ACL: watcher role)", rawSubject)
 }

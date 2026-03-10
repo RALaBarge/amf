@@ -28,11 +28,11 @@ import (
 )
 
 var (
-	port     = flag.Int("port", 8766, "HTTP port for agent card and A2A endpoint")
-	name     = flag.String("name", "amf-worker", "Agent display name")
-	natsURL  = flag.String("nats", "nats://127.0.0.1:4222", "NATS server URL")
-	tags     = flag.String("tags", "text-summarize,code-review,question-answer", "Comma-separated capability tags")
-	trust    = flag.String("trust", "local", "Trust domain")
+	port    = flag.Int("port", 8766, "HTTP port for agent card and A2A endpoint")
+	name    = flag.String("name", "amf-worker", "Agent display name")
+	natsURL = flag.String("nats", "", "NATS URL (default: reads AMF_NATS_URL env, then nats://specialist:amf-specialist-local@127.0.0.1:4222)")
+	tags    = flag.String("tags", "text-summarize,code-review,question-answer", "Comma-separated capability tags")
+	trust   = flag.String("trust", "local", "Trust domain")
 )
 
 const (
@@ -45,13 +45,27 @@ var agentID string
 
 func main() {
 	flag.Parse()
-	agentID = "spiffe://local/agent/" + uuid.New().String()
+	agentID = "spiffe://" + *trust + "/agent/" + uuid.New().String()
 	log.Printf("worker[%s]: starting as %s on port %d", *name, agentID, *port)
+
+	// Resolve NATS URL: flag → env → default with specialist credentials
+	resolvedNATSURL := *natsURL
+	if resolvedNATSURL == "" {
+		resolvedNATSURL = os.Getenv("AMF_NATS_URL")
+	}
+	if resolvedNATSURL == "" {
+		pass := os.Getenv("AMF_SPECIALIST_PASS")
+		if pass == "" {
+			pass = "amf-specialist-local"
+		}
+		resolvedNATSURL = "nats://specialist:" + pass + "@127.0.0.1:4222"
+	}
+	log.Printf("worker: connecting as specialist role")
 
 	// Connect to NATS
 	var err error
 	for i := range 10 {
-		nc, err = nats.Connect(*natsURL)
+		nc, err = nats.Connect(resolvedNATSURL)
 		if err == nil {
 			break
 		}
@@ -150,6 +164,7 @@ func handleTaskAnnounce(data []byte, myTags []string) {
 	}
 	traceID, _ := evt["amftraceid"].(string)
 	requiredCap, _ := payload["required_capability"].(string)
+	replySubject, _ := payload["reply_subject"].(string)
 
 	// Check if we can handle this task
 	canHandle := requiredCap == "" // handle anything if no specific cap required
@@ -175,10 +190,10 @@ func handleTaskAnnounce(data []byte, myTags []string) {
 	publishRaw(TypeTaskClaim, claimEvt)
 
 	// Process task (simulated work)
-	go processTask(taskID, traceID, payload, myTags)
+	go processTask(taskID, traceID, replySubject, payload, myTags)
 }
 
-func processTask(taskID, traceID string, payload map[string]any, myTags []string) {
+func processTask(taskID, traceID, replySubject string, payload map[string]any, myTags []string) {
 	taskDesc, _ := payload["task"].(string)
 	log.Printf("worker: processing task %s: %q", taskID, taskDesc)
 
@@ -193,16 +208,26 @@ func processTask(taskID, traceID string, payload map[string]any, myTags []string
 		publishRaw(TypeTaskProgress, prog)
 	}
 
-	// Publish result
-	result := newWorkerEvent(TypeResultFinal, traceID, taskID, map[string]any{
-		"task_id":    taskID,
-		"worker":     *name,
-		"worker_id":  agentID,
-		"input":      taskDesc,
-		"result":     fmt.Sprintf("[%s] processed: %q — completed by %s", time.Now().Format("15:04:05"), taskDesc, *name),
+	resultText := fmt.Sprintf("[%s] processed: %q — completed by %s", time.Now().Format("15:04:05"), taskDesc, *name)
+	resultPayload := map[string]any{
+		"task_id":           taskID,
+		"worker":            *name,
+		"worker_id":         agentID,
+		"input":             taskDesc,
+		"result":            resultText,
 		"capabilities_used": myTags,
-	})
+	}
+
+	// Publish to canonical result subject
+	result := newWorkerEvent(TypeResultFinal, traceID, taskID, resultPayload)
 	publishRaw(TypeResultFinal, result)
+
+	// If the requester specified a reply subject, publish there too (OpenAI compat)
+	if replySubject != "" {
+		reply := newWorkerEvent(TypeResultFinal, traceID, taskID, resultPayload)
+		publishRaw(replySubject, reply)
+	}
+
 	log.Printf("worker: completed task %s", taskID)
 }
 
@@ -222,7 +247,7 @@ func handleA2ATaskSend(w http.ResponseWriter, r *http.Request) {
 	})
 
 	// Process via NATS
-	go processTask(taskID, uuid.New().String(), body, strings.Split(*tags, ","))
+	go processTask(taskID, uuid.New().String(), "", body, strings.Split(*tags, ","))
 }
 
 func serveAgentCard(capTags []string, endpoint, cardURL string) http.HandlerFunc {

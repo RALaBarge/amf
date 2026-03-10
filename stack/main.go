@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -17,43 +16,29 @@ import (
 )
 
 const (
-	natsURL    = "nats://127.0.0.1:4222"
 	httpAddr   = ":8765"
 	amfSubject = "amf.>"
 )
 
-var nc *nats.Conn
+var (
+	nc       *nats.Conn
+	natsCfg  *AMFNATSConfig
+	identity IdentityProvider
+)
 
-func startNATS() *exec.Cmd {
-	// Find nats-server in PATH or ~/bin
-	natsPath, err := exec.LookPath("nats-server")
-	if err != nil {
-		home, _ := os.UserHomeDir()
-		natsPath = home + "/bin/nats-server"
-	}
-	cmd := exec.Command(natsPath, "--port", "4222")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start nats-server: %v", err)
-	}
-	log.Printf("nats-server started (pid %d)", cmd.Process.Pid)
-	time.Sleep(300 * time.Millisecond)
-	return cmd
-}
-
-func connectNATS() {
+func connectNATSWithRole(url string) *nats.Conn {
+	var conn *nats.Conn
 	var err error
 	for i := range 5 {
-		nc, err = nats.Connect(natsURL)
+		conn, err = nats.Connect(url)
 		if err == nil {
-			log.Printf("connected to NATS at %s", natsURL)
-			return
+			return conn
 		}
 		log.Printf("NATS connect attempt %d failed: %v", i+1, err)
 		time.Sleep(500 * time.Millisecond)
 	}
 	log.Fatalf("could not connect to NATS: %v", err)
+	return nil
 }
 
 // GET /events — SSE stream of all amf.> events
@@ -145,7 +130,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": status, "nats": natsURL})
+	json.NewEncoder(w).Encode(map[string]string{"status": status, "nats": "nats://127.0.0.1:4222"})
 }
 
 // GET /.well-known/agent-card.json — A2A agent card (full capability description)
@@ -176,7 +161,7 @@ func handleAgentCard(rec AgentRecord) http.HandlerFunc {
 				"schema_version":  "1.0.0",
 				"protocols":       rec.ProtocolsSupported,
 				"trust_domain":    rec.TrustDomain,
-				"nats_url":        natsURL,
+				"nats_url":        "nats://127.0.0.1:4222",
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -192,17 +177,31 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	natscmd := startNATS()
+	// Identity provider — static (default) or SPIFFE if socket present
+	identity = NewIdentityProvider("coordinator", "amf-dev", "local")
+	log.Printf("identity: mode=%s id=%s", identity.Mode(), identity.AgentID())
+
+	// NATS with ACL config
+	var err error
+	natsCfg, err := LoadNATSConfig()
+	if err != nil {
+		log.Fatalf("nats config: %v", err)
+	}
+	natscmd := startNATSWithACL(natsCfg)
 	defer natscmd.Process.Kill()
 
-	connectNATS()
+	nc = connectNATSWithRole(natsCfg.CoordinatorURL(""))
 	defer nc.Close()
+	log.Printf("coordinator: connected to NATS (role=coordinator)")
+
+	// Log specialist URL so workers can be started manually
+	log.Printf("workers connect with: %s", natsCfg.SpecialistURL())
 
 	// Publish a startup heartbeat
 	id := uuid.New().String()
 	startEvt := NewEvent(
 		id, uuid.New().String(),
-		"spiffe://local/agent/amf-dev",
+		identity.AgentID(),
 		TypeAgentHeartbeat,
 		RoleCoordinator,
 		map[string]string{"status": "online", "note": "AMF dev stack started"},
@@ -269,13 +268,12 @@ func main() {
 	})
 
 	// Start mDNS — register self and browse for peers
-	agentID := uuid.New().String()
 	selfRecord := AgentRecord{
-		AgentID:            "spiffe://local/agent/" + agentID,
+		AgentID:            identity.AgentID(),
 		Endpoint:           fmt.Sprintf("http://localhost%s", httpAddr),
 		ProtocolsSupported: []string{"A2A/1.0", "MCP/2024-11-05"},
 		CapabilityTags:     []string{"observability", "event-fabric"},
-		TrustDomain:        "local",
+		TrustDomain:        identity.TrustDomain(),
 		Visibility:         "local",
 		Version:            "1.0.0",
 		Status:             "active",
@@ -299,6 +297,9 @@ func main() {
 	mux.HandleFunc("/agents", handleAgents)
 	mux.HandleFunc("/.well-known/agent-card.json", handleAgentCard(selfRecord))
 	mux.HandleFunc("/health", handleHealth)
+	// OpenAI-compatible API
+	mux.HandleFunc("/v1/models", handleOAIModels)
+	mux.HandleFunc("/v1/chat/completions", handleOAIChat)
 	mux.HandleFunc("/", handleUI)
 
 	srv := &http.Server{Addr: httpAddr, Handler: mux}
