@@ -1,7 +1,8 @@
 # AMF Open Decisions — Session 1
 
 **Date:** 2026-03-09
-**Status:** Working through SPEC.md open decisions table. Decisions marked LOCKED are closed. Items marked DISCUSSION are still open pending follow-up.
+**Updated:** 2026-03-09 (session 1 follow-up — #9, #11, #12, #13 closed)
+**Status:** All decisions locked. No open items remain from this session.
 
 ---
 
@@ -218,34 +219,48 @@ Specialist credentials include `amf.internal.reply.*` in their publish allowlist
 
 ---
 
-## #9 — Watcher output integrity (DISCUSSION — partially open)
+## #9 — Watcher output integrity
 
 **Question:** Nothing prevents a compromised watcher from lying about `risk_score` or `extracted_capabilities`. What should the coordinator do?
 
 **Options:**
 - **A — Coordinator re-validates required fields from raw advertisement:** catches lying; breaks DMZ isolation.
 - **B — Watcher signs output with short-lived SVID:** cryptographic proof; requires go-spiffe per goroutine.
-- **C — Accept limitation; rely on OPA being conservative (current).**
+- **C — Accept limitation; rely on OPA being conservative.**
 - **D — Coordinator runs deterministic re-parse of raw advertisement and cross-checks verifiable fields.**
 
-**Current lean: D now, B later.**
+**Decision: D always + B when SPIFFE is active. Residual risk acknowledged and surfaced, not hidden.**
 
-Option D: after receiving a WatcherSummary, coordinator runs its own deterministic re-parse of the raw TXT record. Cross-checks:
+**Layer 1 — Deterministic field cross-verification (always, regardless of SPIFFE):**
+
+After receiving a WatcherSummary, the coordinator re-parses the raw TXT record and verifies:
 - `original_agent_id` must match `id=` in raw TXT
 - `endpoint` must match `ep=` in raw TXT
-- `protocols_supported` must be a ⊆ of `proto=` in raw TXT (watcher can narrow, not expand)
+- `protocols_supported` must be ⊆ of `proto=` in raw TXT (watcher can narrow, not expand)
 - `trust_domain` must match `td=` in raw TXT
 - `card_url` must match `card=` in raw TXT if present
 
 Discrepancy → floor `risk_score` to 1.0, emit `amf.policy.warning` with reason `watcher_summary_mismatch`, deny admission.
 
-**What this catches:** endpoint redirect attacks, protocol expansion, trust domain escalation, agent ID spoofing.
+**Layer 2 — SVID-signed WatcherSummary (when SPIFFE is active):**
 
-**What this doesn't catch:** watcher underreporting `risk_score` (inherently unverifiable without re-running LLM). The residual risk: a compromised watcher produces `risk_score: 0.0` for a genuinely risky agent. The mitigating factor: OPA's structural checks (protocol allowlist, trust domain validity, endpoint format, field cross-verification) are the real gate. A bad agent with a fake-low risk score still has to pass all structural checks.
+When `AMF_IDENTITY_MODE=spiffe`, each watcher goroutine is issued a short-lived JWT-SVID at spawn time (via `go-spiffe/v2` SPIFFE Workload API). The watcher signs its WatcherSummary output using this SVID before publishing to `amf.internal.classified`. The coordinator verifies the signature before processing. A summary with no valid SVID signature is rejected with `amf.policy.deny` and reason `watcher_unsigned_output`.
 
-**Long-term:** Option B (SVID-signed watcher output) closes the risk_score gap. When go-spiffe is wired, watcher goroutines SHOULD sign their output using a short-lived SVID issued at spawn time. The spec should note this as the target state.
+This closes the `risk_score` gap: the coordinator can verify the summary came from a goroutine it issued credentials to, and that it was not tampered with in transit on `amf.internal.classified`.
 
-**Still open:** User position on the residual risk_score gap — accept it under current structural OPA checks, or prioritize B alongside go-spiffe work?
+**Layer 3 — Standing warning in non-SPIFFE deployments:**
+
+When `AMF_IDENTITY_MODE != spiffe`, the coordinator emits `amf.policy.warning` at startup (once) and on every admission cycle (per advertisement processed) with reason `watcher_output_unverified`:
+
+```
+WARN [amf] watcher output integrity: risk_score is self-asserted and cannot be
+cryptographically verified. Enable SPIFFE (AMF_IDENTITY_MODE=spiffe) to require
+SVID-signed WatcherSummary output. Operating in reduced-integrity mode.
+```
+
+This is not suppressible without explicitly setting `AMF_WATCHER_INTEGRITY_WARN=false`. The residual risk is documented, surfaced on every admission, and not papered over.
+
+**Spec addition:** Document the two-tier integrity model explicitly. SPIFFE deployments MUST use SVID-signed watcher output. Non-SPIFFE deployments operate with a documented integrity gap and MUST display the standing warning.
 
 ---
 
@@ -283,40 +298,92 @@ Higher threshold = more permissive. `local` agents get more benefit of the doubt
 
 ---
 
-## #11 / #12 / #13 — MCP routing model, namespace collisions, auth relay (DISCUSSION — open)
+## #11 / #12 / #13 — MCP routing model, namespace collisions, auth relay
 
 ### #11 — Routing model
 
 **Question:** Three models: Model A (direct client access), Model B (coordinator proxy), Model C (federated aggregate / dogfood).
 
-**Dependency:** Choice of #11 determines whether #12 (namespace) is relevant at all, and shapes #13 (auth relay) requirements.
+**Decision: Model C is the target architecture. Model B is the current implementation and remains the internal dispatch mechanism beneath Model C.**
 
-**Current position:**
-- Model B for internal coordinator-initiated calls (coordinator proxies to agents with auth headers, OPA per call, full audit log)
-- Model C (federated aggregate, single `POST /mcp` endpoint) as the external interface goal — but question of v1 vs v2 is **still open**
+Model C — the coordinator exposes a single `POST /mcp` endpoint that aggregates all admitted agents' tools. External LLM clients (Claude, GPT-4, any MCP-compatible client) connect to one place. Every call goes through the coordinator: OPA policy runs per call, auth is enforced, everything is logged. The coordinator dogfoods MCP — it uses the same protocol internally that it exposes externally.
 
-Model C requires: full MCP server implementation on coordinator, tool namespace management, incremental `tools/list` sync as agents join/leave, cache invalidation. Non-trivial.
+Model B's proxy logic (`POST /v1/mcp/proxy?agent=<id>`) does not go away — it becomes the internal implementation layer that Model C dispatches into. When the coordinator receives a `tools/call` on its aggregated endpoint, it resolves the tool to the owning agent and forwards via Model B's proxy path.
 
-The OpenAI-compat layer (`/v1/chat/completions`) already provides an external interface for LLM clients. Model C would add a native MCP interface. Whether that's in scope for v1 is the open question.
+Model A (direct client access, coordinator out of the call path) is explicitly rejected on defensive grounds: it removes the coordinator from the audit and policy path entirely.
 
-### #12 — Tool namespace collisions (blocked on #11)
+**Implementation sequence:**
+1. Model B proxy is current (working). Ship.
+2. Model C aggregation layer on top: `tools/list` aggregates all admitted agents, tool names namespaced by agent ID. `tools/call` dispatches to the correct agent via the Model B proxy path.
+3. `tools/list` response is cached and invalidated on agent admission/eviction events.
 
-Only relevant if Model C is adopted. If #11 → Model B only, defer.
+### #12 — Tool namespace collisions
 
-**If Model C:**
-- Option A (namespace by agent ID) is the correctness floor — `<agent_id>/<tool_name>`, guaranteed unique.
-- Capability tag as shorter namespace (`<tag>/<tool_name>`) is more semantic.
-- Coordinator-managed aliases (B on top of A) for LLM-friendly names is the long-term answer.
+**Decision: Agent ID namespace as the correctness floor. Semantic aliases are opt-in, declared by the agent, collision-rejected.**
+
+Tool names under Model C are `<agent_id>/<tool_name>` — e.g., `spiffe://local/specialist/abc123/text-summarize`. Guaranteed unique. No coordinator logic needed to resolve conflicts at the correctness layer.
+
+**Semantic alias layer (optional, agent-declared):**
+
+Agents MAY declare a preferred short alias in their agent card `x-amf.tool_alias` field:
+```json
+{
+  "x-amf": {
+    "tool_alias": "summarizer"
+  }
+}
+```
+
+If the alias is unique in the current mesh, the coordinator registers `summarizer/text-summarize` → `spiffe://local/specialist/abc123/text-summarize` in the alias table. If two agents claim the same alias, both aliases are rejected and both fall back to agent ID namespace with a `amf.policy.warning` on admission. No silent override of an existing alias — collision is a hard rejection, not a first-wins race.
+
+The `tools/list` response includes both the canonical namespaced name and the alias (if registered):
+```json
+{
+  "name": "summarizer/text-summarize",
+  "description": "...",
+  "x-amf-canonical": "spiffe://local/specialist/abc123/text-summarize"
+}
+```
+
+LLMs receive the alias name where available, canonical name otherwise.
 
 ### #13 — Coordinator-to-agent auth in MCP call path
 
-**Options:**
-- **A — JWT-SVID as Bearer:** correct when SPIFFE active.
-- **B — Pre-shared key per agent:** simple fallback.
-- **C — Unauthenticated for local trust domain.**
-- **D — Reuse NATS role credentials (translation layer needed).**
+**Decision: Three-tier auth model — SVID, TOFU fingerprint, or hard warning. No silent unauthenticated calls.**
 
-**Current lean:** C for local trust domain (agents internal, coordinator is only caller), A when SPIFFE active. Whether a pre-shared key fallback (B) is wanted between C and A is still open.
+**Tier 1 — SPIFFE active (`AMF_IDENTITY_MODE=spiffe`):**
+The coordinator presents a JWT-SVID as a `Bearer` token on every MCP call:
+```
+Authorization: Bearer <coordinator-jwt-svid>
+```
+The agent's MCP server SHOULD verify the SVID against its trust bundle. The spec says SHOULD for now (not MUST) because agent implementations may not all have SPIFFE wired — but the coordinator always presents it regardless.
+
+**Tier 2 — No SPIFFE, TLS present (TOFU fingerprint model):**
+
+At agent admission time, the coordinator records the TLS certificate fingerprint (SHA-256 of the DER-encoded leaf cert) of the agent's MCP endpoint. This is part of the registry entry alongside `mcp_endpoint`. On every subsequent MCP call, the coordinator verifies the presented cert fingerprint matches the recorded value — like SSH known_hosts / `StrictHostKeyChecking=yes`.
+
+The agent similarly records the coordinator's TLS cert fingerprint on first successful contact (Trust On First Use). If the fingerprint changes, both sides MUST reject and emit `amf.policy.warning` with reason `mcp_fingerprint_mismatch`. Fingerprint rotation requires explicit re-registration (agent re-advertises via mDNS, goes back through the admission pipeline).
+
+Fingerprint is stored in the agent registry as `mcp_tls_fingerprint: "sha256:<hex>"`. The coordinator sends its own fingerprint in a custom header on first contact:
+```
+X-AMF-Coordinator-Fingerprint: sha256:<hex>
+```
+
+**Tier 3 — No SPIFFE, no TLS (`http://` endpoint):**
+
+The coordinator MUST emit `amf.policy.warning` on every MCP call with reason `mcp_call_unauthenticated`. The warning includes the agent ID, endpoint, and call method. This is not a one-time startup warning — it fires on every individual call so the audit log clearly reflects the integrity gap.
+
+Calls to plaintext endpoints are blockable with `AMF_MCP_REQUIRE_TLS=true` (default: `false` to preserve local dev usability). When `true`, admission of agents with `http://` MCP endpoints is denied entirely — they fail the deterministic validator with reason `mcp_endpoint_insecure`.
+
+**Summary of tier selection:**
+
+| Condition | Auth mechanism | Warning? |
+|---|---|---|
+| SPIFFE active | JWT-SVID Bearer, agent SHOULD verify | None |
+| No SPIFFE, `https://` endpoint | TOFU TLS fingerprint, both sides verify | None after first contact |
+| No SPIFFE, `https://`, fingerprint mismatch | Reject call | `mcp_fingerprint_mismatch` |
+| No SPIFFE, `http://` endpoint | None | `mcp_call_unauthenticated` on every call |
+| `AMF_MCP_REQUIRE_TLS=true`, `http://` endpoint | Admission denied | `mcp_endpoint_insecure` at admission |
 
 ---
 
@@ -431,11 +498,11 @@ The OPA policy enforces the trust domain restriction — it's not a coordinator 
 | 6 | TTL expiry: warn + optional retry + escalate | **LOCKED — Option C + retry extension** |
 | 7 | Cycle detection (mandatory) + configurable max depth (default 5) | **LOCKED — C + D** |
 | 8 | NATS ACL enforces `amf.internal.reply.*` | **LOCKED — Option B** |
-| 9 | Deterministic field cross-verification (D now), SVID signing (B later) | **DISCUSSION — lean D; residual risk gap open** |
+| 9 | D always (field cross-verification) + B when SPIFFE (SVID-signed output); standing warning when unverified | **LOCKED** |
 | 10 | Risk thresholds in OPA policy data document | **LOCKED — Option B** |
-| 11 | Model B internal; Model C external TBD | **DISCUSSION — v1 scope open** |
-| 12 | Namespace by agent ID (blocked on #11) | **DISCUSSION — blocked** |
-| 13 | Unauthenticated local / JWT-SVID when SPIFFE | **DISCUSSION — pre-shared key fallback open** |
+| 11 | Model C target (federated aggregate); Model B is internal dispatch layer beneath it | **LOCKED** |
+| 12 | Agent ID namespace as correctness floor; opt-in semantic aliases, collision = hard reject | **LOCKED** |
+| 13 | Three-tier: JWT-SVID (SPIFFE) → TOFU TLS fingerprint (no SPIFFE) → mandatory warning per call (no TLS) | **LOCKED** |
 | 15 | Connector stub: creds + subjects defined, rate limiting deferred | **LOCKED — Option B** |
 | 16 | NATS canonical; A2A push out of scope v1 | **LOCKED — A + C** |
 | 17 | Tag allowlist + structured prompt data-role separation | **LOCKED — A + B** |

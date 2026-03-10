@@ -162,9 +162,18 @@ The following decisions are locked. See [2600/open-decisions-session-1.md](2600/
 **A2A interop**
 - NATS subscription is the canonical push mechanism. A2A push notifications (SSE callback URLs) are not supported in v1. A bridge adapter is a v2 roadmap item.
 
-**MCP routing (partially open)**
-- Internal coordinator-initiated MCP calls use Model B (coordinator proxy): `POST /v1/mcp/proxy?agent=<id>`, with OPA enforcement and auth headers per call. When SPIFFE is active, the coordinator presents a JWT-SVID; otherwise calls to `local` trust domain agents are unauthenticated.
-- A single federated MCP endpoint (Model C) that aggregates all admitted agents' tools is a target for a future version. The v1 scope is open — see [2600/open-decisions-session-1.md](2600/open-decisions-session-1.md) #11.
+**Watcher output integrity**
+- When SPIFFE is active, each watcher goroutine is issued a short-lived JWT-SVID at spawn time and MUST sign its WatcherSummary. The coordinator rejects unsigned output with `amf.policy.deny`. When SPIFFE is not active, the coordinator emits `amf.policy.warning` on every admission cycle (`watcher_output_unverified`). This warning is not suppressible without explicitly setting `AMF_WATCHER_INTEGRITY_WARN=false`. The integrity gap is surfaced, not hidden.
+
+**MCP routing**
+- The coordinator exposes a single `POST /mcp` endpoint (Model C — federated aggregate) that aggregates all admitted agents' tools. All external LLM clients connect here. OPA policy runs per call, all calls are logged. The internal dispatch layer (Model B proxy) remains as the mechanism the coordinator uses to forward calls to individual agents. Model A (direct client access, coordinator out of the call path) is rejected — it removes the coordinator from the audit and policy path.
+- Tool names are namespaced `<agent_id>/<tool_name>` (guaranteed unique). Agents may declare a short alias in `x-amf.tool_alias`; aliases are registered first-come, collision = hard reject (both aliases rejected, both fall back to agent ID namespace, `amf.policy.warning` emitted).
+
+**MCP call authentication**
+- Three tiers, in priority order:
+  1. **SPIFFE active:** coordinator presents JWT-SVID as `Authorization: Bearer` on every call. Agent SHOULD verify against trust bundle.
+  2. **No SPIFFE, `https://`:** TOFU TLS fingerprint model (SSH-style). Coordinator records the agent's TLS cert fingerprint (SHA-256) at admission and verifies on every call. Agent records coordinator's fingerprint on first contact via `X-AMF-Coordinator-Fingerprint` header. Fingerprint mismatch → call rejected, `amf.policy.warning` emitted.
+  3. **No SPIFFE, `http://`:** `amf.policy.warning` with reason `mcp_call_unauthenticated` emitted on every individual call (not just at startup). Blockable with `AMF_MCP_REQUIRE_TLS=true`, which denies admission to any agent with a plaintext MCP endpoint.
 
 ---
 
