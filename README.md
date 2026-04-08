@@ -45,6 +45,21 @@ go build -o amf-worker ./cmd/worker
 ./amf-worker --name my-worker --tags text-summarize,code-review
 ```
 
+Run a beigebox LLM proxy (requires local Ollama or compatible backend):
+```bash
+go build -o beigebox ./cmd/beigebox
+./beigebox --name my-box --model llama3.2
+```
+
+Discover agents beyond the local link via DNS-SD:
+```bash
+# coordinator
+./amf-server --dns-domain agents.example.com
+
+# agent — prints zone records to add on startup
+./beigebox --dns-domain agents.example.com --public-host mybox.example.com
+```
+
 ## What's Running
 
 ### Coordinator (`amf-server`, port 8765)
@@ -74,29 +89,56 @@ Registers on mDNS, subscribes to `amf.task.announce`, claims tasks matching its 
 
 ### Beigebox MCP Node
 
-[Beigebox](../beigebox) is a local OpenAI-compatible LLM proxy. When `amf_mesh.enabled: true` is set in its `config.yaml`, it:
+`cmd/beigebox` is the AMF mesh adapter for [BeigeBox](https://github.com/RALaBarge/beigebox) — a thin Go shim that handles mDNS registration, NATS heartbeats, and MCP tool exposure. The full BeigeBox project (Python, multi-backend routing, semantic caching, RAG, plugins) runs separately; this adapter connects it to the mesh.
 
-1. Registers on mDNS with `mcp=http://localhost:8001/mcp` in the TXT record
-2. Publishes a NATS heartbeat on `amf.discovery.agent.heartbeat`
-3. Serves `GET /.well-known/agent-card.json` with `x-amf.mcp_endpoint`
+> **Note:** If BeigeBox is your local backend, point `--backend` at its OpenAI-compatible endpoint. The adapter does not replace BeigeBox — it announces its existence and capabilities to the coordinator so it can be discovered and dispatched to.
 
-The AMF coordinator discovers beigebox via mDNS, validates it through the DMZ watcher and OPA, then admits it to the mesh registry.
+```bash
+go build -o beigebox ./cmd/beigebox
+
+# Point at Ollama (default: http://localhost:11434, model: llama3.2)
+./beigebox
+
+# Specify backend and model
+./beigebox --backend http://localhost:11434 --model qwen2.5:14b --name my-box
+
+# Advertise into a DNS zone (see DNS-SD section below)
+./beigebox --dns-domain agents.example.com --public-host mybox.example.com
+```
+
+On startup beigebox:
+1. Registers on mDNS (`_amf-agent._tcp.local`) with `mcp=<url>` in the TXT record
+2. Connects to NATS as `specialist` and publishes heartbeats every 30s on `amf.discovery.agent.heartbeat`
+3. Serves `POST /mcp` — MCP JSON-RPC with tools: `chat`, `list_models`, `echo`
+4. Proxies `POST /v1/chat/completions` directly to the local LLM backend
+5. Serves `GET /.well-known/agent-card.json` with `x-amf.mcp_endpoint`
+6. Prints DNS zone entries to stdout if `--dns-domain` is set
+
+The coordinator discovers beigebox via mDNS (or DNS-SD), validates it through the DMZ watcher and OPA, then admits it to the mesh registry. The coordinator's federated `POST /mcp` endpoint then exposes beigebox's tools namespaced as `<agent_id>/chat` etc.
+
+Environment variables:
+| Variable | Default | Description |
+|---|---|---|
+| `AMF_SPECIALIST_PASS` | `amf-specialist-local` | NATS specialist password |
+| `AMF_BACKEND_URL` | `http://localhost:11434` | LLM backend base URL |
+| `AMF_BACKEND_MODEL` | `llama3.2` | Default model |
 
 ## Security Model
 
-All inbound advertisements are untrusted. Three layers before anything reaches the coordinator:
+All inbound advertisements are untrusted regardless of how they arrive. Three layers before anything reaches the coordinator:
 
 ```
-[mDNS advertisement]
-        │
-        ▼
+[mDNS advertisement]  [DNS-SD advertisement]
+         │                      │
+         └──────────┬───────────┘
+                    ▼
 [1. Deterministic validation]   — size ≤ 512B, schema, required fields
-        │
-        ▼
+                    │
+                    ▼
 [2. DMZ watcher]                — one goroutine per advertisement, discarded immediately
    LLM risk-scoring (optional)    no shared state, no durable memory
-        │
-        ▼
+                    │
+                    ▼
 [3. Trusted coordinator]        — sees WatcherSummary only, never raw advertisement
    OPA policy check               routing decision
 ```
@@ -112,19 +154,57 @@ schemas/
   event-envelope-1.0.0.json   CloudEvents AMF envelope schema
   agent-record-1.0.0.json     mDNS advertisement schema
 stack/                         Go reference implementation
-  main.go                      coordinator, NATS, HTTP, mDNS
+  main.go                      coordinator, NATS, HTTP, mDNS, DNS-SD
   event.go                     CloudEvents envelope + A2A types
-  discovery.go                 mDNS registration and browsing
+  discovery.go                 mDNS registration, mDNS browser, DNS-SD browser
   watcher.go                   DMZ watcher (per-connection)
   policy.go                    OPA integration
   openai.go                    OpenAI-compatible API layer
+  identity.go                  SPIFFE/static identity provider
+  nats_auth.go                 NATS ACL config (per-role credentials)
   policies/
     allow_advertisement.rego   default admission policy
   cmd/
     worker/                    standalone specialist agent
-    beigebox/                  MCP adapter template
+    beigebox/                  local LLM proxy + MCP node
 2600/                          design discussion archive
 ```
+
+## Discovery
+
+AMF uses two complementary discovery mechanisms, both producing the same TXT record format and both routing through the same DMZ watcher pipeline.
+
+### mDNS (local link)
+
+Default. No configuration needed. Agents register on `_amf-agent._tcp.local` via Avahi/zeroconf and are visible to any coordinator on the same network segment.
+
+### DNS-SD via unicast DNS (RFC 6763 §11)
+
+For agents beyond the local link. Add DNS records to any zone you control, then point the coordinator at that zone.
+
+**Coordinator:**
+```bash
+./amf-server --dns-domain agents.example.com
+```
+Polls `_amf-agent._tcp.agents.example.com` PTR records every 60s. Each discovered agent goes through the same DMZ watcher + OPA admission pipeline as mDNS.
+
+**Agent (beigebox example):**
+```bash
+./beigebox --dns-domain agents.example.com --public-host mybox.example.com
+```
+Prints the DNS records to add on startup:
+```
+; PTR — service type enumeration
+_amf-agent._tcp.agents.example.com. 300 IN PTR my-llm._amf-agent._tcp.agents.example.com.
+; SRV — service location
+my-llm._amf-agent._tcp.agents.example.com. 300 IN SRV 0 0 8768 mybox.example.com.
+; TXT — agent metadata
+my-llm._amf-agent._tcp.agents.example.com. 300 IN TXT "id=..." "ep=..." "mcp=..." ...
+```
+
+Add these to your zone once. The TXT record carries the same key=value pairs as the mDNS TXT record — same parser, same watcher, same admission policy.
+
+**Why this works without a new standard:** RFC 6763 DNS-SD already defines unicast DNS as an equal peer to mDNS. The only difference is `.local.` multicast vs. a real domain over port 53. The AgentDNS IETF drafts are attempting to standardize this at internet scale; AMF uses the same mechanism today on any zone you control.
 
 ## Architecture Decisions
 

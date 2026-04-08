@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/grandcat/zeroconf"
+	"github.com/miekg/dns"
 )
 
 const (
@@ -187,4 +188,177 @@ func handleAgents(w http.ResponseWriter, r *http.Request) {
 		"agents": agents,
 		"count":  len(agents),
 	})
+}
+
+// ---------------------------------------------------------------------------
+// DNS-SD via unicast DNS (RFC 6763 §11)
+//
+// Same service type (_amf-agent._tcp) and TXT record format as mDNS, but
+// queried against a real DNS zone over unicast. This extends discovery to
+// agents beyond the local link — any agent that publishes DNS records in
+// the zone is discovered automatically.
+//
+// Record layout in the zone (operator adds these once):
+//
+//   ; PTR — enables enumeration of service instances
+//   _amf-agent._tcp.<domain>.   300 IN PTR  <instance>._amf-agent._tcp.<domain>.
+//
+//   ; SRV — host and port
+//   <instance>._amf-agent._tcp.<domain>.  300 IN SRV  0 0 <port> <host>.
+//
+//   ; TXT — same key=value pairs as mDNS TXT record
+//   <instance>._amf-agent._tcp.<domain>.  300 IN TXT  "id=..." "ep=..." ...
+//
+// The coordinator polls every 60s. Newly-seen agents are routed through the
+// same DMZ watcher pipeline as mDNS-discovered agents — no special trust.
+
+const dnsPollInterval = 60 * time.Second
+
+// BrowseAgentsDNS polls a DNS zone for _amf-agent._tcp.<domain> PTR records
+// and routes each newly-discovered agent through the DMZ watcher pipeline.
+func BrowseAgentsDNS(ctx context.Context, domain string) {
+	log.Printf("dns-sd: browsing _amf-agent._tcp.%s (poll every %s)", domain, dnsPollInterval)
+	seen := make(map[string]bool)
+
+	poll := func() {
+		records, err := lookupAMFAgents(domain)
+		if err != nil {
+			log.Printf("dns-sd: lookup error: %v", err)
+			return
+		}
+		for _, rec := range records {
+			key := rec.AgentID + "|" + rec.Endpoint
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			log.Printf("dns-sd: discovered agent %s at %s — routing through DMZ watcher", rec.AgentID, rec.Endpoint)
+			if nc != nil && nc.IsConnected() {
+				raw, err := json.Marshal(rec)
+				if err == nil {
+					nc.Publish(rawSubject, raw)
+				}
+			}
+		}
+	}
+
+	poll() // immediate first poll on startup
+	t := time.NewTicker(dnsPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			poll()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// lookupAMFAgents enumerates service instances via PTR then resolves each one.
+func lookupAMFAgents(domain string) ([]AgentRecord, error) {
+	resolver, err := systemResolver()
+	if err != nil {
+		return nil, err
+	}
+	c := &dns.Client{Timeout: 5 * time.Second}
+	service := dns.Fqdn("_amf-agent._tcp." + domain)
+
+	m := new(dns.Msg)
+	m.SetQuestion(service, dns.TypePTR)
+	resp, _, err := c.Exchange(m, resolver)
+	if err != nil {
+		return nil, fmt.Errorf("PTR %s: %w", service, err)
+	}
+
+	var records []AgentRecord
+	for _, ans := range resp.Answer {
+		ptr, ok := ans.(*dns.PTR)
+		if !ok {
+			continue
+		}
+		rec, err := resolveServiceInstance(c, resolver, ptr.Ptr)
+		if err != nil {
+			log.Printf("dns-sd: instance %s: %v", ptr.Ptr, err)
+			continue
+		}
+		records = append(records, rec)
+	}
+	return records, nil
+}
+
+// resolveServiceInstance fetches TXT (and SRV as fallback) for one instance.
+func resolveServiceInstance(c *dns.Client, resolver, instance string) (AgentRecord, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(instance), dns.TypeTXT)
+	resp, _, err := c.Exchange(m, resolver)
+	if err != nil {
+		return AgentRecord{}, fmt.Errorf("TXT query: %w", err)
+	}
+
+	var kv []string
+	for _, ans := range resp.Answer {
+		if t, ok := ans.(*dns.TXT); ok {
+			kv = append(kv, t.Txt...)
+		}
+	}
+	if len(kv) == 0 {
+		return AgentRecord{}, fmt.Errorf("no TXT records for %s", instance)
+	}
+
+	rec, err := txtToAgentRecord(kv)
+	if err != nil {
+		return AgentRecord{}, fmt.Errorf("TXT parse: %w", err)
+	}
+
+	// If ep= was absent in TXT, synthesize endpoint from SRV target:port
+	if rec.Endpoint == "" {
+		m2 := new(dns.Msg)
+		m2.SetQuestion(dns.Fqdn(instance), dns.TypeSRV)
+		if resp2, _, err2 := c.Exchange(m2, resolver); err2 == nil {
+			for _, ans := range resp2.Answer {
+				if srv, ok := ans.(*dns.SRV); ok {
+					host := strings.TrimSuffix(srv.Target, ".")
+					rec.Endpoint = fmt.Sprintf("http://%s:%d", host, srv.Port)
+					break
+				}
+			}
+		}
+	}
+
+	return rec, nil
+}
+
+// systemResolver returns "host:port" for the first nameserver in /etc/resolv.conf.
+// Falls back to 8.8.8.8:53 if the file is missing or empty.
+func systemResolver() (string, error) {
+	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil || len(cfg.Servers) == 0 {
+		return "8.8.8.8:53", nil
+	}
+	return cfg.Servers[0] + ":" + cfg.Port, nil
+}
+
+// DNSZoneEntries returns the DNS records an agent needs to be discoverable
+// via BrowseAgentsDNS. Print these and add them to the zone.
+func DNSZoneEntries(domain, publicHost, instanceName string, port int, txt []string) string {
+	fqdn := instanceName + "._amf-agent._tcp." + domain + "."
+	quoted := make([]string, len(txt))
+	for i, t := range txt {
+		quoted[i] = `"` + t + `"`
+	}
+	return fmt.Sprintf(
+		"; --- AMF DNS-SD records for %s (add to your %s zone) ---\n"+
+			"; PTR — service type enumeration\n"+
+			"_amf-agent._tcp.%s. 300 IN PTR %s\n"+
+			"; SRV — service location\n"+
+			"%s 300 IN SRV 0 0 %d %s.\n"+
+			"; TXT — agent metadata\n"+
+			"%s 300 IN TXT %s\n"+
+			"; --- end ---",
+		instanceName, domain,
+		domain, fqdn,
+		fqdn, port, publicHost,
+		fqdn, strings.Join(quoted, " "),
+	)
 }

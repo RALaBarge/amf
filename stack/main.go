@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,6 +20,8 @@ const (
 	httpAddr   = ":8765"
 	amfSubject = "amf.>"
 )
+
+var dnsDomain = ""
 
 var (
 	nc       *nats.Conn
@@ -177,6 +180,9 @@ func handleUI(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	flag.StringVar(&dnsDomain, "dns-domain", "", "DNS zone to browse for agents (e.g. agents.example.com)")
+	flag.Parse()
+
 	// Identity provider — static (default) or SPIFFE if socket present
 	identity = NewIdentityProvider("coordinator", "amf-dev", "local")
 	log.Printf("identity: mode=%s id=%s", identity.Mode(), identity.AgentID())
@@ -290,6 +296,11 @@ func main() {
 		defer mdnsSrv.Shutdown()
 	}
 	go BrowseAgents(mdnsCtx)
+
+	if dnsDomain != "" {
+		log.Printf("dns-sd: starting unicast DNS browser for domain %s", dnsDomain)
+		go BrowseAgentsDNS(mdnsCtx, dnsDomain)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/events", handleEvents)
