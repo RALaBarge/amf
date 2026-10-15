@@ -2,7 +2,7 @@
 
 **Repository**: https://github.com/RALaBarge/amf  
 **Version**: 0.1.0-draft  
-**License**: Apache 2.0  
+**License**: MIT  
 **Status**: Working Draft — Community Feedback Welcome  
 
 > AMF is an open specification for secure, local-first, multi-agent coordination. It defines schemas, protocols, and trust boundaries for agents to discover, advertise, and collaborate without requiring a central cloud provider.
@@ -566,4 +566,4 @@ Thank you to the open-source communities maintaining these projects. AMF stands 
 ---
 
 *Document generated: March 2026*  
-*License: Apache 2.0 — See LICENSE file in repository*
+*License: MIT — See LICENSE file in repository*
