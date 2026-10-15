@@ -1,6 +1,6 @@
 # Agent Mesh Framework (AMF)
 
-**v0.3.0** · Apache 2.0 · [SPEC.md](SPEC.md)
+**v0.3.0** · MIT · [SPEC.md](SPEC.md)
 
 Open specification and reference implementation for secure, local-first, multi-agent coordination. Agents discover one another via mDNS, communicate via A2A, expose capabilities via MCP, and coordinate through a structured CloudEvents event fabric backed by NATS — no cloud vendor required.
 

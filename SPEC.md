@@ -2,7 +2,7 @@
 
 **Version**: 0.2.0
 **Status**: Working Draft
-**License**: Apache 2.0
+**License**: MIT
 
 > AMF is an open specification for secure, local-first, multi-agent coordination. Agents discover one another via mDNS, communicate via A2A, expose capabilities via MCP, and coordinate via a structured CloudEvents-based event fabric backed by NATS — without requiring a cloud vendor.
 
